@@ -511,6 +511,7 @@ func TestIsConfigMapKey(t *testing.T) {
 		"..bad",
 		"b*d",
 		"bad!&bad",
+		strings.Repeat("a", DNS1123SubdomainMaxLength+1),
 	}
 
 	for i := range failureCases {
@@ -538,6 +539,7 @@ func TestIsWildcardDNS1123Subdomain(t *testing.T) {
 		"*bar.com",
 		"f*.bar.com",
 		"*",
+		"*.foo.bar" + strings.Repeat("r", DNS1123SubdomainMaxLength-len("*.foo.bar")+1),
 	}
 	for _, val := range badValues {
 		if errs := IsWildcardDNS1123Subdomain(val); len(errs) == 0 {
@@ -567,6 +569,7 @@ func TestIsFullyQualifiedDomainName(t *testing.T) {
 	}
 
 	badValues := []string{
+		"",
 		".",
 		"...",
 		".io",
@@ -693,6 +696,7 @@ func TestIsDomainPrefixedPath(t *testing.T) {
 	}
 
 	badValues := []string{
+		"",
 		".",
 		"...",
 		"/b",
@@ -740,6 +744,38 @@ func TestIsValidSocketAddr(t *testing.T) {
 	}
 	for _, val := range badValues {
 		if errs := IsValidSocketAddr(val); len(errs) == 0 {
+			t.Errorf("expected errors for %q", val)
+		}
+	}
+}
+
+func TestIsEnvVarName(t *testing.T) {
+	goodValues := []string{
+		"-startDash",
+		".startDot",
+		"endDash-",
+		"endDot.",
+		"TEST_K8S",
+		"test-k8s",
+		"TEST-k8s",
+		"-.-",
+	}
+	for _, val := range goodValues {
+		if errs := IsEnvVarName(val); len(errs) != 0 {
+			t.Errorf("expected no errors for %q: %v", val, errs)
+		}
+	}
+
+	badValues := []string{
+		"8startsWithNumber",
+		"f()",
+		"example{!0}",
+		"Other$VAR",
+		"",
+		" WITH_SPACE",
+	}
+	for _, val := range badValues {
+		if errs := IsEnvVarName(val); len(errs) == 0 {
 			t.Errorf("expected errors for %q", val)
 		}
 	}
