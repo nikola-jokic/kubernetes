@@ -19,6 +19,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -54,17 +55,72 @@ import (
 	"github.com/onsi/gomega"
 )
 
+// getInternalIP returns node internal IP
+func getInternalIP(node *v1.Node) (string, error) {
+	for _, address := range node.Status.Addresses {
+		if address.Type == v1.NodeInternalIP && address.Address != "" {
+			return address.Address, nil
+		}
+	}
+	return "", fmt.Errorf("couldn't get the internal IP of host %s with addresses %v", node.Name, node.Status.Addresses)
+}
+
+// getSubnetPrefix returns a network prefix based on one of the workers
+// InternalIP adding a /16 or /64 mask depending on the IP family of the node.
+// IMPORTANT: These assumes a flat network assigned to the nodes, that is common
+// on cloud providers.
+func getSubnetPrefix(c clientset.Interface) (*net.IPNet, error) {
+	node, err := getReadySchedulableWorkerNode(c)
+	if err != nil {
+		return nil, fmt.Errorf("error getting a ready schedulable worker Node, err: %v", err)
+	}
+	internalIP, err := getInternalIP(node)
+	if err != nil {
+		return nil, fmt.Errorf("error getting Node internal IP, err: %v", err)
+	}
+	ip := netutils.ParseIPSloppy(internalIP)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IP address format: %s", internalIP)
+	}
+
+	// if IPv6 return a net.IPNet with IP = ip and mask /64
+	ciderMask := net.CIDRMask(64, 128)
+	// if IPv4 return a net.IPNet with IP = ip and mask /16
+	if netutils.IsIPv4(ip) {
+		ciderMask = net.CIDRMask(16, 32)
+	}
+	return &net.IPNet{IP: ip.Mask(ciderMask), Mask: ciderMask}, nil
+}
+
+// getReadySchedulableWorkerNode gets a single worker node which is available for
+// running pods on. If there are no such available nodes it will return an error.
+func getReadySchedulableWorkerNode(c clientset.Interface) (*v1.Node, error) {
+	nodes, err := e2enode.GetReadySchedulableNodes(c)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nodes.Items {
+		node := nodes.Items[i]
+		_, isMaster := node.Labels["node-role.kubernetes.io/master"]
+		_, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
+		if !isMaster && !isControlPlane {
+			return &node, nil
+		}
+	}
+	return nil, fmt.Errorf("there are currently no ready, schedulable worker nodes in the cluster")
+}
+
 var _ = common.SIGDescribe("LoadBalancers", func() {
 	f := framework.NewDefaultFramework("loadbalancers")
 	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
 	var cs clientset.Interface
-	var subnetPrefix []string
+	var subnetPrefix *net.IPNet
 	var err error
 
 	ginkgo.BeforeEach(func() {
 		cs = f.ClientSet
-		subnetPrefix, err = e2enode.GetSubnetPrefix(cs)
+		subnetPrefix, err = getSubnetPrefix(cs)
 		framework.ExpectNoError(err)
 	})
 
@@ -74,7 +130,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		}
 	})
 
-	ginkgo.It("should be able to change the type and ports of a TCP service [Slow]", func() {
+	ginkgo.It("should be able to change the type and ports of a TCP service [Slow]", func(ctx context.Context) {
 		// requires cloud load-balancer support
 		e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws")
 
@@ -284,7 +340,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		testNotReachableHTTP(tcpIngressIP, svcPort, loadBalancerLagTimeout)
 	})
 
-	ginkgo.It("should be able to change the type and ports of a UDP service [Slow]", func() {
+	ginkgo.It("should be able to change the type and ports of a UDP service [Slow]", func(ctx context.Context) {
 		// requires cloud load-balancer support
 		e2eskipper.SkipUnlessProviderIs("gce", "gke")
 
@@ -484,8 +540,8 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		testNotReachableUDP(udpIngressIP, svcPort, loadBalancerLagTimeout)
 	})
 
-	ginkgo.It("should only allow access from service loadbalancer source ranges [Slow]", func() {
-		// this feature currently supported only on GCE/GKE/AWS
+	ginkgo.It("should only allow access from service loadbalancer source ranges [Slow]", func(ctx context.Context) {
+		// this feature currently supported only on GCE/GKE/AWS/AZURE
 		e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws", "azure")
 
 		loadBalancerCreateTimeout := e2eservice.GetServiceLoadBalancerCreationTimeout(cs)
@@ -568,7 +624,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		checkReachabilityFromPod(true, loadBalancerCreateTimeout, namespace, dropPod.Name, svcIP)
 	})
 
-	ginkgo.It("should be able to create an internal type load balancer [Slow]", func() {
+	ginkgo.It("should be able to create an internal type load balancer [Slow]", func(ctx context.Context) {
 		e2eskipper.SkipUnlessProviderIs("azure", "gke", "gce")
 
 		createTimeout := e2eservice.GetServiceLoadBalancerCreationTimeout(cs)
@@ -586,8 +642,12 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 
 		isInternalEndpoint := func(lbIngress *v1.LoadBalancerIngress) bool {
 			ingressEndpoint := e2eservice.GetIngressPoint(lbIngress)
+			ingressIP := netutils.ParseIPSloppy(ingressEndpoint)
+			if ingressIP == nil {
+				framework.Failf("invalid ingressEndpoint IP address format: %s", ingressEndpoint)
+			}
 			// Needs update for providers using hostname as endpoint.
-			return strings.HasPrefix(ingressEndpoint, subnetPrefix[0]+".")
+			return subnetPrefix.Contains(ingressIP)
 		}
 
 		ginkgo.By("creating a service with type LoadBalancer and cloud specific Internal-LB annotation enabled")
@@ -667,7 +727,10 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		if framework.ProviderIs("azure") {
 			ginkgo.By("switching back to interal type LoadBalancer, with static IP specified.")
 			// For a cluster created with CAPZ, node-subnet may not be "10.240.0.0/16", e.g. "10.1.0.0/16".
-			internalStaticIP := fmt.Sprintf("%s.%s.11.11", subnetPrefix[0], subnetPrefix[1])
+			base := netutils.BigForIP(subnetPrefix.IP)
+			offset := big.NewInt(0).SetBytes(netutils.ParseIPSloppy("0.0.11.11").To4()).Int64()
+
+			internalStaticIP := netutils.AddIPOffset(base, int(offset)).String()
 
 			svc, err = jig.UpdateService(func(svc *v1.Service) {
 				svc.Spec.LoadBalancerIP = internalStaticIP
@@ -693,7 +756,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 	// This test creates a load balancer, make sure its health check interval
 	// equals to gceHcCheckIntervalSeconds. Then the interval is manipulated
 	// to be something else, see if the interval will be reconciled.
-	ginkgo.It("should reconcile LB health check interval [Slow][Serial][Disruptive]", func() {
+	ginkgo.It("should reconcile LB health check interval [Slow][Serial][Disruptive]", func(ctx context.Context) {
 		const gceHcCheckIntervalSeconds = int64(8)
 		// This test is for clusters on GCE.
 		// (It restarts kube-controller-manager, which we don't support on GKE)
@@ -766,7 +829,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 	})
 
 	// [LinuxOnly]: Windows does not support session affinity.
-	ginkgo.It("should have session affinity work for LoadBalancer service with ESIPP on [Slow] [LinuxOnly]", func() {
+	ginkgo.It("should have session affinity work for LoadBalancer service with ESIPP on [Slow] [LinuxOnly]", func(ctx context.Context) {
 		// L4 load balancer affinity `ClientIP` is not supported on AWS ELB.
 		e2eskipper.SkipIfProviderIs("aws")
 
@@ -777,7 +840,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 	})
 
 	// [LinuxOnly]: Windows does not support session affinity.
-	ginkgo.It("should be able to switch session affinity for LoadBalancer service with ESIPP on [Slow] [LinuxOnly]", func() {
+	ginkgo.It("should be able to switch session affinity for LoadBalancer service with ESIPP on [Slow] [LinuxOnly]", func(ctx context.Context) {
 		// L4 load balancer affinity `ClientIP` is not supported on AWS ELB.
 		e2eskipper.SkipIfProviderIs("aws")
 
@@ -788,7 +851,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 	})
 
 	// [LinuxOnly]: Windows does not support session affinity.
-	ginkgo.It("should have session affinity work for LoadBalancer service with ESIPP off [Slow] [LinuxOnly]", func() {
+	ginkgo.It("should have session affinity work for LoadBalancer service with ESIPP off [Slow] [LinuxOnly]", func(ctx context.Context) {
 		// L4 load balancer affinity `ClientIP` is not supported on AWS ELB.
 		e2eskipper.SkipIfProviderIs("aws")
 
@@ -799,7 +862,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 	})
 
 	// [LinuxOnly]: Windows does not support session affinity.
-	ginkgo.It("should be able to switch session affinity for LoadBalancer service with ESIPP off [Slow] [LinuxOnly]", func() {
+	ginkgo.It("should be able to switch session affinity for LoadBalancer service with ESIPP off [Slow] [LinuxOnly]", func(ctx context.Context) {
 		// L4 load balancer affinity `ClientIP` is not supported on AWS ELB.
 		e2eskipper.SkipIfProviderIs("aws")
 
@@ -815,7 +878,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 	// 2. Update service to type=ClusterIP. Finalizer should be removed.
 	// 3. Update service to type=LoadBalancer. Finalizer should be added.
 	// 4. Delete service with type=LoadBalancer. Finalizer should be removed.
-	ginkgo.It("should handle load balancer cleanup finalizer for service [Slow]", func() {
+	ginkgo.It("should handle load balancer cleanup finalizer for service [Slow]", func(ctx context.Context) {
 		jig := e2eservice.NewTestJig(cs, f.Namespace.Name, "lb-finalizer")
 
 		ginkgo.By("Create load balancer service")
@@ -847,7 +910,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		e2eservice.WaitForServiceUpdatedWithFinalizer(cs, svc.Namespace, svc.Name, true)
 	})
 
-	ginkgo.It("should be able to create LoadBalancer Service without NodePort and change it [Slow]", func() {
+	ginkgo.It("should be able to create LoadBalancer Service without NodePort and change it [Slow]", func(ctx context.Context) {
 		// requires cloud load-balancer support
 		e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws")
 
@@ -973,7 +1036,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		e2eservice.TestReachableHTTP(tcpIngressIP, svcPort, loadBalancerLagTimeout)
 	})
 
-	ginkgo.It("should be able to preserve UDP traffic when server pod cycles for a LoadBalancer service on different nodes", func() {
+	ginkgo.It("should be able to preserve UDP traffic when server pod cycles for a LoadBalancer service on different nodes", func(ctx context.Context) {
 		// requires cloud load-balancer support
 		e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws", "azure")
 		ns := f.Namespace.Name
@@ -1105,7 +1168,7 @@ var _ = common.SIGDescribe("LoadBalancers", func() {
 		}
 	})
 
-	ginkgo.It("should be able to preserve UDP traffic when server pod cycles for a LoadBalancer service on the same nodes", func() {
+	ginkgo.It("should be able to preserve UDP traffic when server pod cycles for a LoadBalancer service on the same nodes", func(ctx context.Context) {
 		// requires cloud load-balancer support
 		e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws", "azure")
 		ns := f.Namespace.Name
@@ -1244,7 +1307,7 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 	var loadBalancerCreateTimeout time.Duration
 
 	var cs clientset.Interface
-	var subnetPrefix []string
+	var subnetPrefix *net.IPNet
 	var err error
 
 	ginkgo.BeforeEach(func() {
@@ -1253,7 +1316,7 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 
 		cs = f.ClientSet
 		loadBalancerCreateTimeout = e2eservice.GetServiceLoadBalancerCreationTimeout(cs)
-		subnetPrefix, err = e2enode.GetSubnetPrefix(cs)
+		subnetPrefix, err = getSubnetPrefix(cs)
 		framework.ExpectNoError(err)
 	})
 
@@ -1263,7 +1326,7 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		}
 	})
 
-	ginkgo.It("should work for type=LoadBalancer", func() {
+	ginkgo.It("should work for type=LoadBalancer", func(ctx context.Context) {
 		namespace := f.Namespace.Name
 		serviceName := "external-local-lb"
 		jig := e2eservice.NewTestJig(cs, namespace, serviceName)
@@ -1301,17 +1364,26 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		ingressIP := e2eservice.GetIngressPoint(&svc.Status.LoadBalancer.Ingress[0])
 
 		ginkgo.By("reading clientIP using the TCP service's service port via its external VIP")
-		clientIP, err := GetHTTPContent(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout, "/clientip")
+		clientIPPort, err := GetHTTPContent(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout, "/clientip")
 		framework.ExpectNoError(err)
-		framework.Logf("ClientIP detected by target pod using VIP:SvcPort is %s", clientIP)
+		framework.Logf("ClientIP detected by target pod using VIP:SvcPort is %s", clientIPPort)
 
 		ginkgo.By("checking if Source IP is preserved")
-		if strings.HasPrefix(clientIP, subnetPrefix[0]+".") {
+		// The clientIPPort returned from GetHTTPContent is in this format: x.x.x.x:port or [xx:xx:xx::x]:port
+		host, _, err := net.SplitHostPort(clientIPPort)
+		if err != nil {
+			framework.Failf("SplitHostPort returned unexpected error: %q", clientIPPort)
+		}
+		ip := netutils.ParseIPSloppy(host)
+		if ip == nil {
+			framework.Failf("Invalid client IP address format: %q", host)
+		}
+		if subnetPrefix.Contains(ip) {
 			framework.Failf("Source IP was NOT preserved")
 		}
 	})
 
-	ginkgo.It("should work for type=NodePort", func() {
+	ginkgo.It("should work for type=NodePort", func(ctx context.Context) {
 		namespace := f.Namespace.Name
 		serviceName := "external-local-nodeport"
 		jig := e2eservice.NewTestJig(cs, namespace, serviceName)
@@ -1343,7 +1415,7 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		}
 	})
 
-	ginkgo.It("should only target nodes with endpoints", func() {
+	ginkgo.It("should only target nodes with endpoints", func(ctx context.Context) {
 		namespace := f.Namespace.Name
 		serviceName := "external-local-nodes"
 		jig := e2eservice.NewTestJig(cs, namespace, serviceName)
@@ -1419,7 +1491,7 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		}
 	})
 
-	ginkgo.It("should work from pods", func() {
+	ginkgo.It("should work from pods", func(ctx context.Context) {
 		var err error
 		namespace := f.Namespace.Name
 		serviceName := "external-local-pods"
@@ -1477,7 +1549,7 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		}
 	})
 
-	ginkgo.It("should handle updates to ExternalTrafficPolicy field", func() {
+	ginkgo.It("should handle updates to ExternalTrafficPolicy field", func(ctx context.Context) {
 		namespace := f.Namespace.Name
 		serviceName := "external-local-update"
 		jig := e2eservice.NewTestJig(cs, namespace, serviceName)
@@ -1581,11 +1653,22 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		ginkgo.By(fmt.Sprintf("checking source ip is NOT preserved through loadbalancer %v", ingressIP))
 		var clientIP string
 		pollErr := wait.PollImmediate(framework.Poll, 3*e2eservice.KubeProxyLagTimeout, func() (bool, error) {
-			clientIP, err := GetHTTPContent(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout, path)
+			clientIPPort, err := GetHTTPContent(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout, path)
 			if err != nil {
 				return false, nil
 			}
-			if strings.HasPrefix(clientIP, subnetPrefix[0]+".") {
+			// The clientIPPort returned from GetHTTPContent is in this format: x.x.x.x:port or [xx:xx:xx::x]:port
+			host, _, err := net.SplitHostPort(clientIPPort)
+			if err != nil {
+				framework.Logf("SplitHostPort returned unexpected error: %q", clientIPPort)
+				return false, nil
+			}
+			ip := netutils.ParseIPSloppy(host)
+			if ip == nil {
+				framework.Logf("Invalid client IP address format: %q", host)
+				return false, nil
+			}
+			if subnetPrefix.Contains(ip) {
 				return true, nil
 			}
 			return false, nil
@@ -1609,12 +1692,23 @@ var _ = common.SIGDescribe("LoadBalancers ESIPP [Slow]", func() {
 		framework.ExpectNoError(err)
 		loadBalancerPropagationTimeout := e2eservice.GetServiceLoadBalancerPropagationTimeout(cs)
 		pollErr = wait.PollImmediate(framework.PollShortTimeout, loadBalancerPropagationTimeout, func() (bool, error) {
-			clientIP, err := GetHTTPContent(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout, path)
+			clientIPPort, err := GetHTTPContent(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout, path)
 			if err != nil {
 				return false, nil
 			}
-			ginkgo.By(fmt.Sprintf("Endpoint %v:%v%v returned client ip %v", ingressIP, svcTCPPort, path, clientIP))
-			if !strings.HasPrefix(clientIP, subnetPrefix[0]+".") {
+			ginkgo.By(fmt.Sprintf("Endpoint %v:%v%v returned client ip %v", ingressIP, svcTCPPort, path, clientIPPort))
+			// The clientIPPort returned from GetHTTPContent is in this format: x.x.x.x:port or [xx:xx:xx::x]:port
+			host, _, err := net.SplitHostPort(clientIPPort)
+			if err != nil {
+				framework.Logf("SplitHostPort returned unexpected error: %q", clientIPPort)
+				return false, nil
+			}
+			ip := netutils.ParseIPSloppy(host)
+			if ip == nil {
+				framework.Logf("Invalid client IP address format: %q", host)
+				return false, nil
+			}
+			if !subnetPrefix.Contains(ip) {
 				return true, nil
 			}
 			return false, nil
